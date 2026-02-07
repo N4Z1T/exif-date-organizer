@@ -53,6 +53,7 @@ TARGET_PATH = r"C:\Users\Admin\Pictures\Holiday"
 
 # Synology NAS / Linux Example
 TARGET_PATH = r"/volume1/homes/user/Photos"
+```
 
 ⚠️ Disclaimer
 Always backup your data before running batch renaming scripts. While this script includes a "Dry Run" mode and safety checks (unique paths, confidence levels), the author is not responsible for any data loss or corruption.
