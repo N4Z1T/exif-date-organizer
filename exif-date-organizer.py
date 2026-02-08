@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import sys
 import re
@@ -16,7 +17,7 @@ try:
 except ImportError:
     def tqdm(iterable, **kwargs): return iterable
 
-# --- HACHOIR SUPPORT ---
+# --- HACHOIR SUPPORT (VIDEO) ---
 try:
     from hachoir.parser import createParser
     from hachoir.metadata import extractMetadata
@@ -32,7 +33,7 @@ except ImportError:
     pass
 
 # --- CONFIG ---
-LOG_FILENAME = "renamer_v20.log"
+LOG_FILENAME = "exif-date-organizer.log"
 IMAGE_EXT = ('.jpg', '.jpeg', '.png', '.tiff', '.heic')
 VIDEO_EXT = ('.mp4', '.mov', '.avi', '.mkv', '.3gp', '.m4v')
 DATE_OUTPUT_FORMAT = "%Y-%m-%d"
@@ -49,9 +50,9 @@ logging.basicConfig(
 
 # --- UTILS ---
 def setup_arguments():
-    parser = argparse.ArgumentParser(description="Renamer V20: Final Report Edition.")
+    parser = argparse.ArgumentParser(description="EXIF Date Organizer: Rename folders based on media dates.")
     parser.add_argument("path", help="Target folder path")
-    parser.add_argument("--live", action="store_true", help="Execute rename")
+    parser.add_argument("--live", action="store_true", help="Execute rename (Default is Dry Run)")
     parser.add_argument("--confidence", type=float, default=0.6, help="Min confidence (0.0-1.0)")
     parser.add_argument("--non-interactive", action="store_true", help="Auto-skip missing metadata")
     parser.add_argument("--case", default='title', help="Case format (if AI off)")
@@ -128,7 +129,7 @@ def ai_fix_spelling(text, api_key):
                     res_json = response.json()
                     cleaned = res_json['candidates'][0]['content']['parts'][0]['text']
                     final_text = cleaned.strip().replace('"', '').replace("'", "").replace("\n", "").replace("*", "")
-                    time.sleep(2.5) # Pace 2.5s
+                    time.sleep(2.5) # Pace 2.5s (Safe for 30 RPM)
                     return final_text
                 except:
                     return text
@@ -272,8 +273,6 @@ def process_folders(args):
         
         # CASE 3: Nama Dah Betul (Unchanged)
         if new_name == folder_name: 
-            # Kita tak anggap ini 'Skip', tapi 'No Action Needed'
-            # Tak perlu masuk list 'renamed' sebab tak ubah apa-apa
             continue
 
         new_full_path = get_unique_path(os.path.join(target_path, new_name))
@@ -304,17 +303,14 @@ def process_folders(args):
     print(f"⏭️  Skipped               : {len(skipped_list)}")
     print(f"❌ Error                 : {len(error_list)}")
     
-    # Tunjuk detail folder yang diskip (Jika ada)
     if skipped_list:
         print(f"\n{'='*50}")
         print(f"⚠️  SENARAI FOLDER YANG DISKIP:")
         print(f"{'-'*50}")
         for name, reason in skipped_list:
-            # Potong nama folder kalau panjang sangat supaya kemas
             display_name = (name[:45] + '..') if len(name) > 45 else name
             print(f" • {display_name:<50} -> {reason}")
     
-    # Tunjuk error (Jika ada)
     if error_list:
         print(f"\n{'='*50}")
         print(f"❌ SENARAI ERROR:")
