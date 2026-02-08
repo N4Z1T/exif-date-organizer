@@ -48,7 +48,6 @@ logger = logging.getLogger(__name__)
 class AIService:
     """
     Handles AI interactions with proper Rate Limiting and Retry logic.
-    Separated from the main class for better SRP (Single Responsibility Principle).
     """
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -69,10 +68,6 @@ class AIService:
         self.session.mount("https://", HTTPAdapter(max_retries=retries))
 
     def _enforce_rate_limit(self):
-        """
-        Ensures we don't hit the 30 RPM limit.
-        Thread-safe but DOES NOT block other threads from doing non-AI work.
-        """
         with self._lock:
             current_time = time.time()
             elapsed = current_time - self._last_call_time
@@ -82,7 +77,6 @@ class AIService:
             self._last_call_time = time.time()
 
     def get_high_quota_model(self) -> str:
-        """Selects the best available model, prioritizing Gemma 3 12B."""
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.api_key}"
         try:
             self._enforce_rate_limit()
@@ -101,22 +95,19 @@ class AIService:
                 
                 return "gemini-2.0-flash" # Fallback
         except Exception as e:
-            logger.error(f"Failed to list models: {e}")
+            logger.debug(f"Failed to list models: {e}") # Changed to debug
         return "gemma-3-12b-it"
 
     def fix_spelling(self, text: str, case_type: str) -> str:
-        """Fixes spelling using AI."""
         if not self.selected_model:
             self.selected_model = self.get_high_quota_model()
             logger.info(f"🤖 AI Model Locked: {self.selected_model}")
 
-        # Enforce rate limit BEFORE making the call
         self._enforce_rate_limit()
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.selected_model}:generateContent?key={self.api_key}"
         headers = {'Content-Type': 'application/json'}
         
-        # Dynamic Prompt
         if case_type == 'upper':
             case_instr = "WAJIB tukar SEMUA teks kepada HURUF BESAR (UPPERCASE)."
         else:
@@ -163,8 +154,6 @@ class MediaFolderOrganizer:
         self.max_workers: int = args.workers
         self.confidence_threshold: float = args.confidence
         self.case_type: str = args.case
-        
-        # Initialize AI Service if key is present
         self.ai_service = AIService(args.ai_api_key) if args.ai_api_key else None
 
     def run(self) -> None:
@@ -247,13 +236,10 @@ class MediaFolderOrganizer:
 
         # 3. Rename with Atomic Safety
         parent_dir = os.path.dirname(folder_path)
-        
-        # ATOMIC PATH GENERATION (Fix for Race Condition)
         new_full_path = self._get_unique_path_atomic(parent_dir, new_name)
         
         if self.live_run:
             try:
-                # NAS Safety: Check if source still exists
                 if not os.path.exists(folder_path):
                     result['status'] = 'error'
                     result['reason'] = 'Source folder disappeared'
@@ -273,9 +259,6 @@ class MediaFolderOrganizer:
         return result
 
     def _get_unique_path_atomic(self, base_dir: str, target_name: str) -> str:
-        """
-        Generates a unique path safely using a marker file strategy to prevent race conditions.
-        """
         base_path = os.path.join(base_dir, target_name)
         if not os.path.exists(base_path):
             return base_path
@@ -284,9 +267,6 @@ class MediaFolderOrganizer:
         while True:
             new_path = f"{base_path} ({counter})"
             if not os.path.exists(new_path):
-                # NOTE: On a NAS/Folder rename, strict atomic locking is complex.
-                # We assume checking exists() inside this worker is sufficient for now 
-                # as os.rename is generally atomic on POSIX systems (Linux/Synology).
                 return new_path
             counter += 1
 
@@ -321,7 +301,8 @@ class MediaFolderOrganizer:
                 if not exif: return None
                 date_str = exif.get(36867) or exif.get(306)
                 if date_str: return self._normalize_date(date_str)
-        except Exception: pass
+        except Exception as e:
+            logger.debug(f"Image EXIF Error ({os.path.basename(filepath)}): {e}") # Debug only
         return None
 
     def _get_date_from_video(self, filepath: str) -> Optional[datetime]:
@@ -333,7 +314,8 @@ class MediaFolderOrganizer:
                     metadata = extractMetadata(parser)
                 if metadata and metadata.has("creation_date"):
                     return metadata.get("creation_date")
-        except Exception: pass
+        except Exception as e:
+            logger.debug(f"Video Metadata Error ({os.path.basename(filepath)}): {e}") # Debug only
         return None
 
     @staticmethod
@@ -369,31 +351,44 @@ class MediaFolderOrganizer:
             for item in results['skipped'][:10]:
                 logger.info(f" • {item['name'][:40]:<45} -> {item['reason']}")
 
-def setup_logging(log_filename: str) -> None:
-    logging.basicConfig(
-        level=logging.INFO, # Changed to INFO to reduce noise
-        filename=log_filename,
-        filemode='w',
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(logging.INFO)
-    console.setFormatter(logging.Formatter('%(message)s'))
-    logging.getLogger('').addHandler(console)
+def setup_logging(log_filename: str, debug_mode: bool) -> None:
+    """Configures logging: INFO by default, DEBUG if requested."""
+    
+    # 1. Tentukan level berdasarkan flag
+    log_level = logging.DEBUG if debug_mode else logging.INFO
+
+    # 2. Reset root logger (penting supaya tak ada handler berganda)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    root_logger.handlers = [] # Clear existing
+
+    # 3. File Handler (Ikut flag DEBUG/INFO)
+    file_handler = logging.FileHandler(log_filename, mode='w')
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S"))
+    root_logger.addHandler(file_handler)
+
+    # 4. Console Handler (Kekal INFO supaya UI bersih)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO) 
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
+    root_logger.addHandler(console_handler)
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="EXIF Pro Organizer V22")
+    parser = argparse.ArgumentParser(description="EXIF Pro Organizer V23")
     parser.add_argument("path", help="Target folder path")
     parser.add_argument("--live", action="store_true", help="Execute rename")
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 4)
     parser.add_argument("--confidence", type=float, default=0.6)
     parser.add_argument("--case", default='upper', choices=['title', 'upper', 'lower', 'sentence'])
     parser.add_argument("--ai-api-key", help="Google AI API Key", default=None)
-    parser.add_argument("--non-interactive", action="store_true", help=argparse.SUPPRESS) # Compatibility
+    parser.add_argument("--debug", action="store_true", help="Enable verbose DEBUG logs in file") # <--- NEW FLAG
+    parser.add_argument("--non-interactive", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
-    setup_logging("exif-pro-organizer.log")
+    
+    # Pass debug flag to logging setup
+    setup_logging("exif-pro-organizer.log", args.debug)
     
     organizer = MediaFolderOrganizer(args)
     organizer.run()
