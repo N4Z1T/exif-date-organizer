@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import os
 import sys
 import re
@@ -11,19 +12,20 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from datetime import datetime
-from PIL import Image, ExifTags
+from typing import List, Tuple, Optional, Dict, Any, Iterable
 
-# --- THREADING LOCKS ---
-# Lock untuk print supaya text tak bercampur aduk di skrin
-PRINT_LOCK = threading.Lock()
-# Lock untuk AI supaya kita tak hantar request serentak (Elak 429)
-AI_LOCK = threading.Lock()
+# --- Library Safety Imports ---
+try:
+    from PIL import Image, ExifTags
+except ImportError:
+    sys.exit("Pillow library not found. Please run 'pip install Pillow'.")
 
-# --- LIBRARIES ---
 try:
     from tqdm import tqdm
 except ImportError:
-    def tqdm(iterable, **kwargs): return iterable
+    def tqdm(iterable: Iterable, **kwargs: Any) -> Iterable:
+        """A dummy tqdm function if the library is not installed."""
+        return iterable
 
 try:
     from hachoir.parser import createParser
@@ -35,341 +37,438 @@ except ImportError:
 try:
     import pillow_heif
     pillow_heif.register_heif_opener()
+    HEIF_AVAILABLE = True
 except ImportError:
-    pass
+    HEIF_AVAILABLE = False
 
-# --- CONFIG ---
-LOG_FILENAME = "exif-organizer-parallel.log"
-IMAGE_EXT = ('.jpg', '.jpeg', '.png', '.tiff', '.heic')
-VIDEO_EXT = ('.mp4', '.mov', '.avi', '.mkv', '.3gp', '.m4v')
-DATE_OUTPUT_FORMAT = "%Y-%m-%d"
-IGNORED_DIRS = {'@eaDir', '#recycle', '.DS_Store', 'Thumbs.db', 'venv'}
-IGNORED_FILES = {'SYNOFILE_THUMB', 'desktop.ini', '.DS_Store'}
+# --- Constants ---
+# Using a central logger instance
+logger = logging.getLogger(__name__)
 
-# --- LOGGING ---
-logging.basicConfig(
-    filename=LOG_FILENAME,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
 
-# --- UTILS ---
-def setup_arguments():
-    parser = argparse.ArgumentParser(description="EXIF Parallel Organizer V21")
-    parser.add_argument("path", help="Target folder path")
-    parser.add_argument("--live", action="store_true", help="Execute rename")
-    parser.add_argument("--workers", type=int, default=4, help="Number of parallel threads (Default: 4)")
-    parser.add_argument("--confidence", type=float, default=0.6, help="Min confidence")
-    parser.add_argument("--non-interactive", action="store_true", help="Auto-skip missing metadata")
-    parser.add_argument("--case", default='title', help="Case format (if AI off)")
-    parser.add_argument("--ai-api-key", help="Google AI Studio API Key", default=None)
-    return parser.parse_args()
+class MediaFolderOrganizer:
+    """
+    Encapsulates the logic for organizing media folders in parallel.
+    """
+    IMAGE_EXT: Tuple[str, ...] = ('.jpg', '.jpeg', '.png', '.tiff', '.heic')
+    VIDEO_EXT: Tuple[str, ...] = ('.mp4', '.mov', '.avi', '.mkv', '.3gp', '.m4v')
+    IGNORED_DIRS: set = {'@eaDir', '#recycle', '.DS_Store', 'Thumbs.db', 'venv'}
+    IGNORED_FILES: set = {'SYNOFILE_THUMB', 'desktop.ini', '.DS_Store'}
 
-def safe_print(msg, end="\n"):
-    """Thread-safe print function"""
-    with PRINT_LOCK:
-        print(msg, end=end)
+    def __init__(self, args: argparse.Namespace):
+        """
+        Initializes the organizer with command-line arguments.
 
-def clean_folder_name_regex(foldername, case_type='title'):
-    cleaned = re.sub(r"^[\d\.\-\/\s]+", "", foldername).strip()
-    if not cleaned: return foldername
-    if case_type == 'upper': return cleaned.upper()
-    elif case_type == 'lower': return cleaned.lower()
-    elif case_type == 'title': return cleaned.title()
-    elif case_type == 'sentence': return cleaned.capitalize()
-    return cleaned.title()
+        Args:
+            args: An argparse.Namespace object containing parsed command-line arguments.
+        """
+        self.target_path: str = os.path.abspath(args.path)
+        self.live_run: bool = args.live
+        self.max_workers: int = args.workers
+        self.confidence_threshold: float = args.confidence
+        self.case_type: str = args.case
+        self.ai_api_key: Optional[str] = args.ai_api_key
 
-# --- AI LOGIC ---
-SELECTED_MODEL = None
+        self.selected_ai_model: Optional[str] = None
+        self.ai_lock = threading.Lock()
 
-def get_high_quota_model(api_key):
-    # Logic sama macam V20
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            models = [m['name'].replace('models/', '') for m in data.get('models', [])]
-            
-            gemma_smart = [m for m in models if 'gemma-3' in m and ('12b' in m or '27b' in m)]
-            if gemma_smart: return gemma_smart[0]
-            
-            any_gemma = [m for m in models if 'gemma' in m]
-            if any_gemma: return any_gemma[0]
-            
-            return "gemini-2.0-flash"
-    except Exception as e:
-        logging.error(f"Model list failed: {e}")
-    return "gemma-3-12b-it"
+    def run(self) -> None:
+        """
+        Executes the main folder processing logic.
+        """
+        logger.info("=" * 40)
+        logger.info(f"TARGET: {self.target_path}")
+        logger.info(f"MODE  : {'[LIVE RENAME]' if self.live_run else '[DRY RUN]'}")
+        logger.info(f"WORKERS: {self.max_workers} Threads")
+        logger.info(f"CASE  : {self.case_type.upper()}")
+        logger.info(f"AI    : {'ENABLED' if self.ai_api_key else 'OFF'}")
+        logger.info("=" * 40)
 
-def ai_fix_spelling(text, api_key):
-    global SELECTED_MODEL
-    
-    # --- CRITICAL: AI LOCK ---
-    # Hanya satu thread boleh guna AI pada satu masa untuk maintain pace
-    with AI_LOCK:
-        if not api_key: return text
+        if not os.path.exists(self.target_path):
+            logger.error("Target path not found!")
+            return
 
-        if SELECTED_MODEL is None:
-            safe_print("   [SYSTEM] Selecting Model...", end="\r")
-            SELECTED_MODEL = get_high_quota_model(api_key)
-            safe_print(f"   [SYSTEM] MODEL: {SELECTED_MODEL}                 ")
+        subdirs = self._get_subdirectories()
+        if not subdirs:
+            logger.info("No subdirectories found to process.")
+            return
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{SELECTED_MODEL}:generateContent?key={api_key}"
-        headers = {'Content-Type': 'application/json'}
-        
-        prompt = (
-            f"Tugas: Formatkan tajuk ini. \n"
-            f"WAJIB tukar SEMUA HURUF BESAR kepada 'Title Case'.\n"
-            f"WAJIB betulkan ejaan Bahasa Melayu.\n"
-            f"Kekalkan akronim (KADA, JKR, KPKM) HURUF BESAR.\n"
-            f"JANGAN tambah ulasan. HANYA bagi nama akhir.\n\n"
-            f"Input: {text}\nOutput:"
-        )
+        results = self._execute_parallel_processing(subdirs)
+        self._generate_final_report(results, len(subdirs))
 
-        data = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 60}
+    def _get_subdirectories(self) -> List[str]:
+        """Scans and returns a sorted list of valid subdirectories."""
+        all_items = [f.path for f in os.scandir(self.target_path) if f.is_dir()]
+        valid_dirs = [d for d in all_items if os.path.basename(d) not in self.IGNORED_DIRS]
+        return sorted(valid_dirs)
+
+    def _execute_parallel_processing(self, dir_paths: List[str]) -> Dict[str, List[Any]]:
+        """
+        Manages the thread pool to process directories in parallel.
+
+        Args:
+            dir_paths: A list of absolute paths to the directories to process.
+
+        Returns:
+            A dictionary summarizing the results of the operations.
+        """
+        results_summary: Dict[str, List[Any]] = {
+            'renamed': [], 'skipped': [], 'error': [], 'unchanged': []
         }
+        logger.info(f"🚀 Starting {self.max_workers} parallel workers...")
 
-        # Static Wait Logic
-        max_retries = 3
-        for attempt in range(max_retries):
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_folder = {
+                executor.submit(self._process_folder_worker, folder): folder
+                for folder in dir_paths
+            }
+            
+            progress_bar = tqdm(as_completed(future_to_folder), total=len(dir_paths), unit="folder")
+            for future in progress_bar:
+                try:
+                    result = future.result()
+                    status = result.get('status', 'error')
+                    results_summary[status].append(result)
+                except Exception as exc:
+                    folder = future_to_folder[future]
+                    logger.critical(f"Worker for '{os.path.basename(folder)}' crashed: {exc}", exc_info=True)
+                    results_summary['error'].append({'name': os.path.basename(folder), 'reason': str(exc)})
+        
+        return results_summary
+
+    def _process_folder_worker(self, folder_path: str) -> Dict[str, Any]:
+        """
+        The core worker function that processes a single folder.
+        This function is executed by each thread in the pool.
+
+        Args:
+            folder_path: The absolute path to the folder to process.
+
+        Returns:
+            A dictionary containing the processing result for the folder.
+        """
+        folder_name = os.path.basename(folder_path)
+        result: Dict[str, Any] = {'status': 'skipped', 'name': folder_name, 'reason': '', 'original_name': folder_name}
+
+        date_stats, total_files = self._collect_dates(folder_path)
+
+        if not date_stats:
+            result['reason'] = "No metadata dates found"
+            return result
+
+        most_common_date_str, count = date_stats.most_common(1)[0]
+        confidence = count / total_files if total_files > 0 else 0
+
+        if confidence < self.confidence_threshold:
+            result['reason'] = f"Low Confidence ({confidence:.2f})"
+            return result
+
+        clean_base = self._clean_folder_name(folder_name)
+        
+        # Bersihkan nama dahulu ikut format yang diminta (upper/title)
+        pre_processed_name = self._apply_case(clean_base)
+        
+        if self.ai_api_key:
+            # AI akan betulkan ejaan TAPI ikut format case yang dipilih
+            final_name_part = self._ai_fix_spelling(pre_processed_name)
+        else:
+            final_name_part = pre_processed_name
+
+        new_name = f"{most_common_date_str} {final_name_part}"
+        result['new_name'] = new_name
+        
+        if new_name == folder_name:
+            result['status'] = 'unchanged'
+            return result
+
+        parent_dir = os.path.dirname(folder_path)
+        new_full_path = self._get_unique_path(os.path.join(parent_dir, new_name))
+        
+        if self.live_run:
             try:
-                response = requests.post(url, headers=headers, data=json.dumps(data), timeout=20)
+                os.rename(folder_path, new_full_path)
+                result['status'] = 'renamed'
+                logger.info(f"[OK] Renamed '{folder_name}' -> '{os.path.basename(new_full_path)}'")
+            except OSError as e:
+                result['status'] = 'error'
+                result['reason'] = str(e)
+                logger.error(f"[ERR] Failed to rename '{folder_name}': {e}")
+        else:
+            result['status'] = 'renamed'  # Represents a successful dry run
+            logger.info(f"[DRY RUN] '{folder_name}' -> '{os.path.basename(new_full_path)}'")
+
+        return result
+
+    def _collect_dates(self, folder_path: str) -> Tuple[Optional[Counter], int]:
+        """
+        Scans all media files in a folder and collects their creation dates.
+        """
+        date_counter: Counter = Counter()
+        all_files = []
+        for dirpath, dirnames, filenames in os.walk(folder_path):
+            dirnames[:] = [d for d in dirnames if d not in self.IGNORED_DIRS]
+            for f in filenames:
+                if any(ignored in f for ignored in self.IGNORED_FILES):
+                    continue
+                if f.lower().endswith(self.IMAGE_EXT + self.VIDEO_EXT):
+                    all_files.append(os.path.join(dirpath, f))
+
+        if not all_files:
+            return None, 0
+
+        for filepath in all_files:
+            date_obj = None
+            if filepath.lower().endswith(self.IMAGE_EXT):
+                date_obj = self._get_date_from_image(filepath)
+            elif filepath.lower().endswith(self.VIDEO_EXT):
+                date_obj = self._get_date_from_video(filepath)
+            
+            if date_obj:
+                date_counter[date_obj.strftime("%Y-%m-%d")] += 1
+        
+        return date_counter, len(all_files)
+
+    def _get_date_from_image(self, filepath: str) -> Optional[datetime]:
+        """Extracts creation date from image EXIF data."""
+        try:
+            with Image.open(filepath) as img:
+                exif = img.getexif()
+                if not exif:
+                    return None
                 
-                if response.status_code == 200:
-                    try:
+                # EXIF tags for DateTimeOriginal (36867) and DateTime (306)
+                date_str = exif.get(36867) or exif.get(306)
+                if date_str:
+                    return self._normalize_date(date_str)
+        except Exception as e:
+            logger.debug(f"Could not read EXIF from image: {filepath} - {e}", exc_info=True)
+        return None
+
+    def _get_date_from_video(self, filepath: str) -> Optional[datetime]:
+        """Extracts creation date from video metadata using Hachoir."""
+        if not HACHOIR_AVAILABLE:
+            return None
+        try:
+            parser = createParser(filepath)
+            if not parser:
+                return None
+            with parser:
+                metadata = extractMetadata(parser)
+            if metadata and metadata.has("creation_date"):
+                return metadata.get("creation_date")
+        except Exception as e:
+            logger.debug(f"Could not read metadata from video: {filepath} - {e}", exc_info=True)
+        return None
+
+    @staticmethod
+    def _normalize_date(date_str: str) -> Optional[datetime]:
+        """Parses a date string (YYYY:MM:DD HH:MM:SS) into a datetime object."""
+        try:
+            # Takes the date part, ignoring time
+            return datetime.strptime(str(date_str).split(" ")[0], "%Y:%m:%d")
+        except (ValueError, TypeError):
+            return None
+
+    def _ai_fix_spelling(self, text: str) -> str:
+        """
+        Uses Google Generative AI to format and correct the spelling of a title.
+        This method is thread-safe via a lock.
+        """
+        with self.ai_lock:
+            if self.selected_ai_model is None:
+                logger.info("Selecting best available AI model...")
+                self.selected_ai_model = self._get_high_quota_model()
+                logger.info(f"AI Model selected: {self.selected_ai_model}")
+
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.selected_ai_model}:generateContent?key={self.ai_api_key}"
+            headers = {'Content-Type': 'application/json'}
+            
+            # --- DYNAMIC PROMPT BASED ON USER PREFERENCE ---
+            if self.case_type == 'upper':
+                case_instruction = "WAJIB tukar SEMUA teks kepada HURUF BESAR (UPPERCASE)."
+            else:
+                case_instruction = "WAJIB tukar SEMUA HURUF BESAR kepada 'Title Case' (Huruf Besar Awal)."
+
+            prompt = (
+                "Tugas: Formatkan tajuk ini. \n"
+                f"{case_instruction}\n"
+                "WAJIB betulkan ejaan Bahasa Melayu.\n"
+                "Kekalkan akronim (KADA, JKR, KPKM) HURUF BESAR.\n"
+                "JANGAN tambah ulasan. HANYA bagi nama akhir.\n\n"
+                f"Input: {text}\nOutput:"
+            )
+            
+            data = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 60}
+            }
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = requests.post(url, headers=headers, data=json.dumps(data), timeout=20)
+                    if response.status_code == 200:
                         res_json = response.json()
                         cleaned = res_json['candidates'][0]['content']['parts'][0]['text']
                         final_text = cleaned.strip().replace('"', '').replace("'", "").replace("\n", "").replace("*", "")
-                        
-                        # SAFETY PACE: 2.5s sleep INSIDE THE LOCK
-                        time.sleep(2.5) 
+                        time.sleep(2.5)  # Pace requests
                         return final_text
-                    except:
-                        return text
-                
-                elif response.status_code == 429:
-                    wait_time = 10 
-                    safe_print(f"   [WAIT] Quota Penuh. Rehat {wait_time}s...", end="\r")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    return text
-            except Exception:
-                time.sleep(2)
-                continue
+                    elif response.status_code == 429:
+                        wait_time = 10
+                        logger.warning(f"AI rate limit hit. Waiting for {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"AI API returned error {response.status_code}: {response.text}")
+                        return text  # Return original on other errors
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"AI request failed on attempt {attempt + 1}: {e}")
+                    time.sleep(2)
             
-        return text
+            logger.error("AI request failed after all retries.")
+            return text
 
-# --- METADATA LOGIC ---
-def normalize_date(date_str):
-    try:
-        return datetime.strptime(str(date_str).split(" ")[0], "%Y:%m:%d")
-    except: return None
-
-def get_date_from_image(filepath):
-    try:
-        with Image.open(filepath) as img:
-            exif = img.getexif()
-            if not exif: return None
-            date_str = exif.get(36867) or exif.get(306)
-            if date_str: return normalize_date(date_str)
-    except: pass
-    return None
-
-def get_date_from_video(filepath):
-    if not HACHOIR_AVAILABLE: return None
-    try:
-        parser = createParser(filepath)
-        if not parser: return None
-        with parser:
-            metadata = extractMetadata(parser)
-            if metadata and metadata.has("creation_date"):
-                return metadata.get("creation_date")
-    except: pass
-    return None
-
-def collect_dates(folder_path):
-    """Fungsi ini berjalan dalam thread berasingan"""
-    date_counter = Counter()
-    total_files = 0
-    all_files = []
-    
-    for dirpath, dirnames, filenames in os.walk(folder_path):
-        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
-        for f in filenames:
-            if any(j in f for j in IGNORED_FILES): continue
-            if f.lower().endswith(IMAGE_EXT + VIDEO_EXT):
-                all_files.append(os.path.join(dirpath, f))
-
-    if not all_files: return None, 0
-
-    # Kita tak guna TQDM di sini sebab akan mess up console bila parallel
-    for filepath in all_files:
-        total_files += 1
-        date_obj = None
-        if filepath.lower().endswith(IMAGE_EXT):
-            date_obj = get_date_from_image(filepath)
-        elif filepath.lower().endswith(VIDEO_EXT):
-            date_obj = get_date_from_video(filepath)
+    def _get_high_quota_model(self) -> str:
+        """Selects the best available Gemma/Gemini model."""
+        if not self.ai_api_key:
+            return "gemini-2.0-flash"  # Default fallback
         
-        if date_obj:
-            date_counter[date_obj.strftime("%Y-%m-%d")] += 1
-            
-    return date_counter, total_files
-
-def get_unique_path(base_path):
-    if not os.path.exists(base_path): return base_path
-    counter = 1
-    while True:
-        new_path = f"{base_path} ({counter})"
-        if not os.path.exists(new_path): return new_path
-        counter += 1
-
-# --- WORKER FUNCTION ---
-def process_single_folder(folder_path, args):
-    """
-    Ini adalah 'Pekerja' yang akan dijalankan oleh ThreadPool
-    Mengembalikan status (result) untuk summary
-    """
-    folder_name = os.path.basename(folder_path)
-    result = {'status': 'skipped', 'name': folder_name, 'reason': '', 'new_name': ''}
-
-    # 1. SCANNING (PARALLEL)
-    date_stats, total_files = collect_dates(folder_path)
-
-    if not date_stats:
-        result['reason'] = 'Tiada metadata'
-        return result
-
-    most_common_date_str, count = date_stats.most_common(1)[0]
-    confidence = count / total_files if total_files > 0 else 0
-
-    if confidence < args.confidence:
-        result['reason'] = f'Low Confidence ({confidence:.2f})'
-        return result
-
-    # 2. AI PROCESSING (SERIALIZED VIA LOCK)
-    clean_base = clean_folder_name_regex(folder_name, args.case)
-    
-    # Bahagian ini akan tunggu giliran (AI_LOCK)
-    if args.ai_api_key:
-        final_name = ai_fix_spelling(clean_base, args.ai_api_key)
-    else:
-        final_name = clean_base
-
-    new_name = f"{most_common_date_str} {final_name}"
-    
-    if new_name == folder_name:
-        result['status'] = 'unchanged'
-        return result
-
-    # 3. RENAMING
-    # Kita perlu lock juga masa rename file path supaya tak conflict (jarang berlaku tapi selamat)
-    # Tapi get_unique_path check file system, jadi ia OK run parallel asalkan parent dir berbeza
-    
-    parent_dir = os.path.dirname(folder_path)
-    new_full_path = get_unique_path(os.path.join(parent_dir, new_name))
-    
-    if args.live:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.ai_api_key}"
         try:
-            os.rename(folder_path, new_full_path)
-            result['status'] = 'renamed'
-            result['new_name'] = new_name
-            safe_print(f"[OK] {folder_name} -> {new_name}")
-            logging.info(f"Renamed: {folder_name} -> {new_name}")
-        except OSError as e:
-            result['status'] = 'error'
-            result['reason'] = str(e)
-            safe_print(f"[ERR] {folder_name}: {e}")
-            logging.error(f"Error {folder_name}: {e}")
-    else:
-        result['status'] = 'renamed' # Dry run success
-        result['new_name'] = new_name
-        safe_print(f"[DRY] {folder_name} -> {new_name}")
-        logging.info(f"[DRY] {folder_name} -> {new_name}")
-
-    return result
-
-# --- MAIN PROCESS ---
-def process_folders(args):
-    target_path = os.path.abspath(args.path)
-    
-    print(f"\n{'='*40}")
-    print(f" TARGET: {target_path}")
-    print(f" MODE  : {'[LIVE RENAME]' if args.live else '[DRY RUN]'}")
-    print(f" WORKER: {args.workers} Threads")
-    print(f"{'='*40}\n")
-
-    if not os.path.exists(target_path): 
-        print("Path not found!")
-        return
-
-    subdirs = sorted([f.path for f in os.scandir(target_path) if f.is_dir()])
-    subdirs = [d for d in subdirs if os.path.basename(d) not in IGNORED_DIRS]
-    total_folders = len(subdirs)
-
-    results_summary = {
-        'renamed': [],
-        'skipped': [],
-        'error': [],
-        'unchanged': []
-    }
-
-    print(f"🚀 Memulakan {args.workers} worker parallel...\n")
-
-    # --- PARALLEL EXECUTION BLOCK ---
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        # Hantar semua kerja kepada workers
-        future_to_folder = {executor.submit(process_single_folder, folder, args): folder for folder in subdirs}
-        
-        # Monitor progress menggunakan TQDM
-        for future in tqdm(as_completed(future_to_folder), total=total_folders, unit="folder"):
-            try:
-                data = future.result()
-                status = data['status']
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                models = [m['name'].replace('models/', '') for m in data.get('models', [])]
                 
-                if status == 'renamed':
-                    results_summary['renamed'].append((data['name'], data['new_name']))
-                elif status == 'skipped':
-                    results_summary['skipped'].append((data['name'], data['reason']))
-                elif status == 'error':
-                    results_summary['error'].append((data['name'], data['reason']))
-                elif status == 'unchanged':
-                    results_summary['unchanged'].append(data['name'])
-                    
-            except Exception as exc:
-                safe_print(f"\n[CRITICAL ERROR] Worker crashed: {exc}")
+                # Priority: High-end Gemma -> Any Gemma -> Gemini Flash
+                if any('gemma-3' in m and ('12b' in m or '27b' in m) for m in models):
+                    return next(m for m in models if 'gemma-3' in m and ('12b' in m or '27b' in m))
+                if any('gemma' in m for m in models):
+                    return next(m for m in models if 'gemma' in m)
+                return "gemini-2.0-flash"
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch AI model list: {e}")
+        
+        return "gemma-3-12b-it"  # Optimistic default
 
-    # --- FINAL REPORT ---
-    print(f"\n{'='*50}")
-    print(f"              LAPORAN AKHIR (PARALLEL)")
-    print(f"{'='*50}")
-    
-    print(f"📂 Total Folder     : {total_folders}")
-    print(f"✅ Berjaya Rename   : {len(results_summary['renamed'])}")
-    print(f"⏭️  Skipped          : {len(results_summary['skipped'])}")
-    print(f"💤 Tiada Perubahan  : {len(results_summary['unchanged'])}")
-    print(f"❌ Error            : {len(results_summary['error'])}")
-    
-    if results_summary['skipped']:
-        print(f"\n{'='*50}")
-        print(f"⚠️  DETAIL SKIP (SAMPEL):")
-        print(f"{'-'*50}")
-        for name, reason in results_summary['skipped'][:10]: # Tunjuk 10 pertama je
-            display = (name[:40] + '..') if len(name) > 40 else name
-            print(f" • {display:<45} -> {reason}")
-        if len(results_summary['skipped']) > 10:
-            print(f"   ... dan {len(results_summary['skipped'])-10} lagi.")
+    @staticmethod
+    def _clean_folder_name(foldername: str) -> str:
+        """Removes leading date-like prefixes from a folder name."""
+        return re.sub(r"^[\d\.\-\/\s]+", "", foldername).strip()
 
-    print(f"{'='*50}\n")
+    def _apply_case(self, text: str) -> str:
+        """Applies a specific case formatting to a string."""
+        if self.case_type == 'upper':
+            return text.upper()
+        if self.case_type == 'lower':
+            return text.lower()
+        if self.case_type == 'sentence':
+            return text.capitalize()
+        return text.title()
+
+    @staticmethod
+    def _get_unique_path(base_path: str) -> str:
+        """Ensures a file path is unique by appending a counter if it exists."""
+        if not os.path.exists(base_path):
+            return base_path
+        counter = 1
+        while True:
+            new_path = f"{base_path} ({counter})"
+            if not os.path.exists(new_path):
+                return new_path
+            counter += 1
+            
+    @staticmethod
+    def _generate_final_report(results: Dict[str, List[Dict]], total_folders: int) -> None:
+        """Prints a summary report of the processing results."""
+        renamed_count = len(results['renamed'])
+        skipped_count = len(results['skipped'])
+        unchanged_count = len(results['unchanged'])
+        error_count = len(results['error'])
+        
+        logger.info("=" * 50)
+        logger.info("              FINAL REPORT (PARALLEL)")
+        logger.info("=" * 50)
+        logger.info(f"📂 Total Folders Scanned : {total_folders}")
+        logger.info(f"✅ Successfully Renamed    : {renamed_count}")
+        logger.info(f"⏭️  Skipped                 : {skipped_count}")
+        logger.info(f"💤 Unchanged               : {unchanged_count}")
+        logger.info(f"❌ Errors                  : {error_count}")
+        
+        if results['skipped']:
+            logger.info("-" * 50)
+            logger.info("⚠️  SKIPPED FOLDERS (SAMPLE):")
+            for item in results['skipped'][:10]:
+                name = item.get('name', 'N/A')
+                reason = item.get('reason', 'N/A')
+                display_name = (name[:40] + '..') if len(name) > 40 else name
+                logger.info(f" • {display_name:<45} -> {reason}")
+            if skipped_count > 10:
+                logger.info(f"   ... and {skipped_count - 10} more.")
+
+        if results['error']:
+            logger.info("-" * 50)
+            logger.info("❌ ERRORS:")
+            for item in results['error']:
+                name = item.get('name', 'N/A')
+                reason = item.get('reason', 'N/A')
+                logger.error(f" • {name} -> {reason}")
+
+        logger.info("=" * 50)
+
+
+def setup_logging(log_filename: str) -> None:
+    """Configures logging to both console and file."""
+    logging.basicConfig(
+        level=logging.DEBUG, # Capture all levels for the file
+        filename=log_filename,
+        filemode='w',
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO) # Only show INFO and above on console
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
+    logging.getLogger('').addHandler(console_handler)
+
+
+def main() -> None:
+    """Main entry point of the script."""
+    parser = argparse.ArgumentParser(
+        description="EXIF Parallel Organizer: A high-speed tool to rename media folders based on content dates.",
+        epilog="Example: python exif-parallel-organizer.py \"/path/to/media\" --live --workers 8"
+    )
+    parser.add_argument("path", help="Target folder path containing media subdirectories.")
+    parser.add_argument("--live", action="store_true", help="Execute rename operations. Default is Dry Run.")
+    parser.add_argument("--workers", type=int, default=os.cpu_count() or 4, help=f"Number of parallel threads to use. Default is system CPU count (or 4).")
+    parser.add_argument("--confidence", type=float, default=0.6, help="Minimum confidence level (0.0-1.0) required to rename. Default: 0.6")
+    parser.add_argument("--case", default='upper', choices=['title', 'upper', 'lower', 'sentence'], help="Case format for names if AI is disabled. Default: upper.")
+    parser.add_argument("--ai-api-key", help="Your Google AI Studio API Key to enable AI-powered naming.", default=None)
+    
+    # Deprecated/Unused argument for compatibility, can be removed later
+    parser.add_argument("--non-interactive", action="store_true", help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    log_filename = "exif-parallel-organizer.log"
+    setup_logging(log_filename)
+    
+    # Inform user about optional dependencies
+    if not HACHOIR_AVAILABLE:
+        logger.warning("Hachoir library not found. Video metadata processing will be skipped.")
+    if not HEIF_AVAILABLE:
+        logger.warning("pillow-heif library not found. HEIC file processing may fail.")
+        
+    try:
+        organizer = MediaFolderOrganizer(args)
+        organizer.run()
+    except KeyboardInterrupt:
+        logger.info("\nProcess interrupted by user. Exiting.")
+        sys.exit(0)
+    except Exception as e:
+        logger.critical(f"An unexpected critical error occurred: {e}", exc_info=True)
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    args = setup_arguments()
-    try:
-        process_folders(args)
-    except KeyboardInterrupt:
-        print("\nStopped.")
+    main()
