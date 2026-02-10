@@ -6,21 +6,18 @@ import re
 import logging
 import argparse
 import json
-import requests
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from datetime import datetime
-from typing import List, Tuple, Optional, Dict, Any, Iterable
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from typing import List, Tuple, Optional, Dict, Any, Iterable, Set
 
 # --- Library Safety Imports ---
 try:
     from PIL import Image, ExifTags
 except ImportError:
-    sys.exit("Pillow library not found. Please run 'pip install Pillow'.")
+    sys.exit("CRITICAL ERROR: 'Pillow' library not found.\nPlease run: pip install Pillow")
 
 try:
     from tqdm import tqdm
@@ -28,6 +25,7 @@ except ImportError:
     def tqdm(iterable: Iterable, **kwargs: Any) -> Iterable:
         return iterable
 
+# --- Optional Libraries Check ---
 try:
     from hachoir.parser import createParser
     from hachoir.metadata import extractMetadata
@@ -42,116 +40,65 @@ try:
 except ImportError:
     HEIF_AVAILABLE = False
 
-# --- Configuration Constants ---
+# --- SYSTEM DEFAULTS ---
+DEFAULT_IGNORED_DIRS = {'@eaDir', '#recycle', '.DS_Store', 'venv', '.git', 'lost+found', 'Thumbs.db'}
+DEFAULT_IGNORED_FILES = {'SYNOFILE_THUMB', 'desktop.ini', '.DS_Store', 'Thumbs.db'}
+DEFAULT_IGNORED_EXT = {'.db', '.tmp', '.ini', '.txt', '.log', '.json', '.sh', '.py'}
+
 INVALID_FILENAME_CHARS = r'[<>:"/\\|?*]'
 IMAGE_EXT = ('.jpg', '.jpeg', '.png', '.tiff', '.heic')
 VIDEO_EXT = ('.mp4', '.mov', '.avi', '.mkv', '.3gp', '.m4v')
-IGNORED_DIRS = {'@eaDir', '#recycle', '.DS_Store', 'Thumbs.db', 'venv', '.git'}
-IGNORED_FILES = {'SYNOFILE_THUMB', 'desktop.ini', '.DS_Store'}
+
+# --- TUNING KNOBS ---
+SAMPLE_SIZE = 50       # Scan max 50 fail per folder
+MIN_YEAR = 2000        # Tarikh bawah 2000 dianggap error (Unix epoch/Bad battery)
+MAX_YEAR = datetime.now().year + 1 # Tarikh masa depan dianggap error
 
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# MODULE 1: AI SERVICE (Network I/O)
-# ==========================================
-class AIService:
-    """Handles interaction with Google Gemini API with Rate Limiting."""
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.selected_model = None
-        self._last_call_time = 0
-        self._lock = threading.Lock()
-        
-        self.session = requests.Session()
-        retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503])
-        self.session.mount("https://", HTTPAdapter(max_retries=retries))
-
-    def _enforce_rate_limit(self):
-        """Ensures 30 RPM (1 request per ~2s)."""
-        with self._lock:
-            current_time = time.time()
-            elapsed = current_time - self._last_call_time
-            if elapsed < 2.2:
-                time.sleep(2.2 - elapsed)
-            self._last_call_time = time.time()
-
-    def get_model(self) -> str:
-        """Finds the best model (Gemma 3) or falls back."""
-        if self.selected_model: return self.selected_model
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.api_key}"
-        try:
-            self._enforce_rate_limit()
-            res = self.session.get(url, timeout=10)
-            if res.status_code == 200:
-                models = [m['name'].replace('models/', '') for m in res.json().get('models', [])]
-                # Priority: Gemma 3 -> Any Gemma -> Gemini Flash
-                self.selected_model = next((m for m in models if 'gemma-3' in m and ('12b' in m or '27b' in m)),
-                                      next((m for m in models if 'gemma' in m), "gemini-2.0-flash"))
-            else:
-                self.selected_model = "gemma-3-12b-it" # Optimistic default
-        except Exception:
-            self.selected_model = "gemma-3-12b-it"
-            
-        logger.info(f"🤖 AI Model Selected: {self.selected_model}")
-        return self.selected_model
-
-    def fix_spelling(self, text: str, case_type: str) -> str:
-        model = self.get_model()
-        self._enforce_rate_limit()
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
-        case_instr = "WAJIB tukar SEMUA teks kepada HURUF BESAR." if case_type == 'upper' else "WAJIB tukar HURUF BESAR kepada 'Title Case'."
-        
-        prompt = (
-            f"Tugas: Formatkan tajuk folder ini.\n{case_instr}\n"
-            "WAJIB betulkan ejaan Bahasa Melayu.\nKekalkan akronim (KADA, JKR) HURUF BESAR.\n"
-            f"Input: {text}\nOutput:"
-        )
-
-        try:
-            res = self.session.post(url, headers={'Content-Type': 'application/json'}, 
-                                  data=json.dumps({"contents": [{"parts": [{"text": prompt}]}]}), timeout=20)
-            if res.status_code == 200:
-                return res.json()['candidates'][0]['content']['parts'][0]['text'].strip().replace('"', '').replace("'", "").replace("\n", "")
-        except Exception as e:
-            logger.debug(f"AI Error: {e}")
-        
-        return text
-
-# ==========================================
-# MODULE 2: METADATA SCANNER (Disk Read)
+# MODULE 1: METADATA SCANNER
 # ==========================================
 class MetadataScanner:
-    """Handles file scanning and date extraction."""
-    
+    def __init__(self, ignored_dirs: Set[str], ignored_files: Set[str], ignored_ext: Set[str]):
+        self.ignored_dirs = ignored_dirs
+        self.ignored_files = ignored_files
+        self.ignored_ext = ignored_ext
+
     def scan_folder(self, folder_path: str) -> Tuple[Counter, int]:
         date_counter = Counter()
         files_found = []
         
         for dirpath, dirnames, filenames in os.walk(folder_path):
-            dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
+            dirnames[:] = [d for d in dirnames if d not in self.ignored_dirs]
             for f in filenames:
-                if any(i in f for i in IGNORED_FILES): continue
-                if f.lower().endswith(IMAGE_EXT + VIDEO_EXT):
-                    files_found.append(os.path.join(dirpath, f))
+                if any(i in f for i in self.ignored_files): continue
+                ext = os.path.splitext(f)[1].lower()
+                if ext in self.ignored_ext: continue
+                
+                if ext in IMAGE_EXT: files_found.insert(0, os.path.join(dirpath, f))
+                elif ext in VIDEO_EXT: files_found.append(os.path.join(dirpath, f))
 
         if not files_found: return Counter(), 0
 
-        # Scan files (Limit logging to avoid I/O spam)
+        scanned_count = 0
+        valid_dates_found = 0
+        
         for filepath in files_found:
+            if valid_dates_found >= SAMPLE_SIZE: break
+                
             date_obj = self._get_date(filepath)
+            scanned_count += 1
             if date_obj:
                 date_counter[date_obj.strftime("%Y-%m-%d")] += 1
+                valid_dates_found += 1
                 
-        return date_counter, len(files_found)
+        return date_counter, scanned_count
 
     def _get_date(self, filepath: str) -> Optional[datetime]:
         ext = os.path.splitext(filepath)[1].lower()
-        if ext in IMAGE_EXT:
-            return self._get_image_date(filepath)
-        elif ext in VIDEO_EXT:
-            return self._get_video_date(filepath)
+        if ext in IMAGE_EXT: return self._get_image_date(filepath)
+        elif ext in VIDEO_EXT: return self._get_video_date(filepath)
         return None
 
     def _get_image_date(self, filepath: str) -> Optional[datetime]:
@@ -176,20 +123,31 @@ class MetadataScanner:
 
     @staticmethod
     def _parse_date(date_str: Any) -> Optional[datetime]:
+        """
+        Parses date strings robustly AND checks for Sanity (Year 2000-Current).
+        """
+        if not date_str: return None
         try:
-            return datetime.strptime(str(date_str).split(" ")[0], "%Y:%m:%d")
-        except (ValueError, TypeError): return None
+            s = str(date_str).strip().split('+')[0].split('Z')[0].replace('T', ' ')
+            date_part = s.split(' ')[0].replace('-', ':')
+            dt = datetime.strptime(date_part, "%Y:%m:%d")
+            
+            # --- DATE SANITY CHECK ---
+            if MIN_YEAR <= dt.year <= MAX_YEAR:
+                return dt
+            else:
+                return None # Reject 1970 or 2099
+                
+        except (ValueError, TypeError, IndexError): return None
 
 # ==========================================
-# MODULE 3: RENAME EXECUTOR (Disk Write)
+# MODULE 2: RENAME EXECUTOR
 # ==========================================
 class RenameExecutor:
-    """Handles safe renaming with sanitization and locking."""
     def __init__(self):
-        self._rename_lock = threading.Lock() # Global lock for atomic check-and-rename
+        self._rename_lock = threading.Lock()
 
     def sanitize_name(self, name: str) -> str:
-        """Removes characters invalid on Windows/NAS/Linux."""
         return re.sub(INVALID_FILENAME_CHARS, '', name).strip()
 
     def get_unique_path(self, base_path: str) -> str:
@@ -201,10 +159,6 @@ class RenameExecutor:
             counter += 1
 
     def execute(self, old_path: str, new_name: str, live_mode: bool) -> Tuple[str, str]:
-        """
-        Returns: (status, final_path_name)
-        Status: 'renamed', 'dry_run', 'error', 'unchanged'
-        """
         parent_dir = os.path.dirname(old_path)
         safe_name = self.sanitize_name(new_name)
         target_base_path = os.path.join(parent_dir, safe_name)
@@ -212,28 +166,21 @@ class RenameExecutor:
         if os.path.basename(old_path) == safe_name:
             return 'unchanged', safe_name
 
-        # CRITICAL SECTION: Atomic Check & Rename
-        # Only one thread can determine uniqueness and rename at a time
         if live_mode:
             with self._rename_lock:
                 final_path = self.get_unique_path(target_base_path)
-                
                 try:
-                    # Final safety check
-                    if not os.path.exists(old_path): 
-                        return 'error', "Source missing"
-                    
+                    if not os.path.exists(old_path): return 'error', "Source missing"
                     os.rename(old_path, final_path)
                     return 'renamed', os.path.basename(final_path)
                 except OSError as e:
                     return 'error', str(e)
         else:
-            # Dry Run doesn't need strict locking but logic mirrors it
             final_path = self.get_unique_path(target_base_path)
             return 'dry_run', os.path.basename(final_path)
 
 # ==========================================
-# MODULE 4: ORCHESTRATOR
+# MODULE 3: ORCHESTRATOR
 # ==========================================
 class MediaFolderOrganizer:
     def __init__(self, args):
@@ -243,62 +190,116 @@ class MediaFolderOrganizer:
         self.confidence = args.confidence
         self.case = args.case
         
-        # Init Components
-        self.scanner = MetadataScanner()
+        self.ignored_dirs = DEFAULT_IGNORED_DIRS.union(set(args.ignore_dirs))
+        self.ignored_ext = DEFAULT_IGNORED_EXT.union(set(args.ignore_ext))
+        
+        self.scanner = MetadataScanner(self.ignored_dirs, DEFAULT_IGNORED_FILES, self.ignored_ext)
         self.executor = RenameExecutor()
-        self.ai = AIService(args.ai_api_key) if args.ai_api_key else None
 
     def _clean_base_name(self, name: str) -> str:
+        # Regex: Remove leading dates/numbers/symbols
         clean = re.sub(r"^[\d\.\-\/\s]+", "", name).strip()
-        if not clean: return name
+        if not clean: return ""
+        
+        # Apply Case Logic Locally
         if self.case == 'upper': return clean.upper()
         if self.case == 'lower': return clean.lower()
         return clean.title()
 
     def _process_folder(self, folder_path: str) -> Dict[str, Any]:
         folder_name = os.path.basename(folder_path)
-        result = {'status': 'skipped', 'name': folder_name, 'reason': '', 'new_name': ''}
+        result = {'status': 'skipped', 'name': folder_name, 'reason': '', 'new_name': '', 'original_path': folder_path}
 
         # 1. SCAN
         dates, total = self.scanner.scan_folder(folder_path)
         if not dates:
-            result['reason'] = "No metadata"
+            result['reason'] = "No valid dates found (Empty)"
             return result
             
         # 2. DECIDE
-        top_date, count = dates.most_common(1)[0]
-        conf = count / total
+        try:
+            top_date_info = dates.most_common(1)
+            if not top_date_info:
+                result['reason'] = "Date list empty"
+                return result
+            top_date, count = top_date_info[0]
+            if not top_date: 
+                result['reason'] = "Top date None"
+                return result
+        except IndexError:
+            result['reason'] = "Index Error"
+            return result
+
+        conf = count / total if total > 0 else 0
         if conf < self.confidence:
             result['reason'] = f"Low confidence ({conf:.2f})"
             return result
 
-        # 3. PLAN NAME
+        # 3. PLAN (No AI, just Regex + Case)
         base_name = self._clean_base_name(folder_name)
-        if self.ai:
-            base_name = self.ai.fix_spelling(base_name, self.case)
-        
-        new_name_candidate = f"{top_date} {base_name}"
+        new_name_candidate = f"{top_date} {base_name}".strip()
 
         # 4. EXECUTE
         status, final_name = self.executor.execute(folder_path, new_name_candidate, self.live_run)
         
         result['status'] = status
         result['new_name'] = final_name
-        if status == 'error': result['reason'] = final_name # final_name contains error msg here
+        result['full_new_path'] = os.path.join(os.path.dirname(folder_path), final_name)
+        if status == 'error': result['reason'] = final_name
         
         return result
 
+    def generate_reports(self, results: List[Dict]):
+        """Generates JSON Report and Bash Undo Script"""
+        
+        # 1. JSON Report
+        json_path = "report.json"
+        try:
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=4, ensure_ascii=False)
+            logger.info(f"📄 Forensic Report saved to: {json_path}")
+        except Exception as e:
+            logger.error(f"Failed to save JSON report: {e}")
+
+        # 2. Undo Script (Bash)
+        undo_path = "undo_restore.sh"
+        renamed_items = [r for r in results if r['status'] == 'renamed']
+        
+        if renamed_items:
+            try:
+                with open(undo_path, 'w', encoding='utf-8') as f:
+                    f.write("#!/bin/bash\n")
+                    f.write("# Undo Script generated by EXIF Organizer\n\n")
+                    for item in renamed_items:
+                        old = item['original_path'].replace('"', '\\"')
+                        new = item['full_new_path'].replace('"', '\\"')
+                        f.write(f'mv "{new}" "{old}"\n')
+                
+                os.chmod(undo_path, 0o755)
+                logger.info(f"↩️  Undo Script saved to: {undo_path}")
+            except Exception as e:
+                logger.error(f"Failed to save Undo script: {e}")
+
     def run(self):
-        logger.info(f"🚀 Starting NAS Organizer V24")
+        print("\n" + "="*40)
+        print("SYSTEM CHECK (V34 Offline)")
+        print("="*40)
+        if HACHOIR_AVAILABLE: print("✅ [OK] hachoir (Video)")
+        else: print("⚠️  [WARNING] 'hachoir' missing. Videos skipped.")
+        if HEIF_AVAILABLE: print("✅ [OK] pillow-heif (HEIC)")
+        else: print("⚠️  [WARNING] 'pillow-heif' missing. HEIC skipped.")
+        print("="*40 + "\n")
+
+        logger.info(f"🚀 Starting NAS Organizer V34")
         logger.info(f"📂 Target: {self.target_path}")
-        logger.info(f"🛠️  Mode: {'LIVE' if self.live_run else 'DRY RUN'}")
-        logger.info(f"🧵 Workers: {self.workers}")
+        logger.info(f"📅 Year Check: {MIN_YEAR} - {MAX_YEAR}")
         
         subdirs = sorted([f.path for f in os.scandir(self.target_path) if f.is_dir() 
-                         and os.path.basename(f.path) not in IGNORED_DIRS])
+                         and os.path.basename(f.path) not in self.ignored_dirs])
         
         stats = Counter()
         skipped_details = []
+        all_results = []
 
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             futures = {pool.submit(self._process_folder, f): f for f in subdirs}
@@ -306,6 +307,7 @@ class MediaFolderOrganizer:
             for fut in tqdm(as_completed(futures), total=len(subdirs), unit="dir"):
                 try:
                     res = fut.result()
+                    all_results.append(res)
                     stats[res['status']] += 1
                     
                     if res['status'] == 'renamed':
@@ -321,6 +323,8 @@ class MediaFolderOrganizer:
                     logger.critical(f"Worker Crash: {e}")
                     stats['crash'] += 1
 
+        self.generate_reports(all_results)
+
         print("\n" + "="*40)
         print("          FINAL REPORT")
         print("="*40)
@@ -330,36 +334,39 @@ class MediaFolderOrganizer:
         print(f"💤 Unchanged     : {stats['unchanged']}")
         print(f"⏭️  Skipped       : {stats['skipped']}")
         print(f"❌ Errors        : {stats['error']}")
+        print("-" * 40)
+        print(f"📄 Full Report   : report.json")
+        if stats['renamed'] > 0:
+            print(f"↩️  Undo Script   : ./undo_restore.sh")
         
         if skipped_details:
             print("-" * 40)
             print("⚠️  Skipped Samples:")
             for s in skipped_details[:5]: print(f" • {s}")
+            if len(skipped_details) > 5: print(f"   ... and {len(skipped_details)-5} more (see json).")
         print("="*40 + "\n")
 
-# ==========================================
-# MAIN ENTRY POINT
-# ==========================================
 def main():
-    parser = argparse.ArgumentParser(description="NAS Photo Organizer V24")
+    parser = argparse.ArgumentParser(description="NAS Photo Organizer V34 (Offline)")
     parser.add_argument("path", help="Folder path")
     parser.add_argument("--live", action="store_true", help="Enable renaming")
-    parser.add_argument("--workers", type=int, default=4, help="Default: 4 (NAS Safe)")
+    parser.add_argument("--workers", type=int, default=4, help="Default: 4")
     parser.add_argument("--confidence", type=float, default=0.6)
     parser.add_argument("--case", default='upper', choices=['title', 'upper', 'lower'])
-    parser.add_argument("--ai-api-key", help="Gemini API Key")
+    
+    # Optional flags
     parser.add_argument("--debug", action="store_true", help="Enable verbose logs")
+    parser.add_argument("--ignore-dirs", nargs='+', default=[], help="Add dirs to ignore")
+    parser.add_argument("--ignore-ext", nargs='+', default=[], help="Add extensions to ignore")
 
     args = parser.parse_args()
     
-    # Configure Logging (File only for debug/info to save console spam)
     lvl = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(filename="exif-nas.log", filemode='w', level=lvl,
                         format="%(asctime)s - %(levelname)s - %(message)s")
     
-    # Console gets cleaner output via print/tqdm, minimal logs
     console = logging.StreamHandler()
-    console.setLevel(logging.WARNING) # Only warn/error on console to keep tqdm clean
+    console.setLevel(logging.WARNING) 
     logging.getLogger('').addHandler(console)
 
     if not os.path.exists(args.path):
