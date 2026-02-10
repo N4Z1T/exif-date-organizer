@@ -1,379 +1,209 @@
-#!/usr/bin/env python3
-
+import streamlit as st
 import os
 import sys
 import re
-import logging
-import argparse
-import json
-import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import Counter
-from datetime import datetime
-from typing import List, Tuple, Optional, Dict, Any, Iterable, Set
+from crewai import Agent, Task, Crew, Process, LLM
 
-# --- Library Safety Imports ---
-try:
-    from PIL import Image, ExifTags
-except ImportError:
-    sys.exit("CRITICAL ERROR: 'Pillow' library not found.\nPlease run: pip install Pillow")
+# --- 1. KONFIGURASI HALAMAN ---
+st.set_page_config(
+    page_title="Pasukan AI Qwen - Tempatan",
+    page_icon="🛡️",
+    layout="wide"
+)
 
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(iterable: Iterable, **kwargs: Any) -> Iterable:
-        return iterable
+# --- 2. FUNGSI PEMBANTU ---
+class StreamToExpander:
+    def __init__(self, expander):
+        self.expander = expander
+        self.buffer = []
+        self.colors = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
 
-# --- Optional Libraries Check ---
-try:
-    from hachoir.parser import createParser
-    from hachoir.metadata import extractMetadata
-    HACHOIR_AVAILABLE = True
-except ImportError:
-    HACHOIR_AVAILABLE = False
+    def write(self, data):
+        clean_data = self.colors.sub('', data)
+        if clean_data.strip():
+            self.buffer.append(clean_data)
+            self.expander.code("\n".join(self.buffer[-15:]), language="text")
 
-try:
-    import pillow_heif
-    pillow_heif.register_heif_opener()
-    HEIF_AVAILABLE = True
-except ImportError:
-    HEIF_AVAILABLE = False
+    def flush(self):
+        pass
 
-# --- SYSTEM DEFAULTS ---
-DEFAULT_IGNORED_DIRS = {'@eaDir', '#recycle', '.DS_Store', 'venv', '.git', 'lost+found', 'Thumbs.db'}
-DEFAULT_IGNORED_FILES = {'SYNOFILE_THUMB', 'desktop.ini', '.DS_Store', 'Thumbs.db'}
-DEFAULT_IGNORED_EXT = {'.db', '.tmp', '.ini', '.txt', '.log', '.json', '.sh', '.py'}
+def extract_python_code(text):
+    pattern = r'```python\n(.*?)```'
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        return match.group(1)
+    else:
+        return "# Tiada blok kod Python dijumpai."
 
-INVALID_FILENAME_CHARS = r'[<>:"/\\|?*]'
-IMAGE_EXT = ('.jpg', '.jpeg', '.png', '.tiff', '.heic')
-VIDEO_EXT = ('.mp4', '.mov', '.avi', '.mkv', '.3gp', '.m4v')
+# --- 3. SIDEBAR ---
+with st.sidebar:
+    st.title("🎛️ Pusat Kawalan")
+    
+    # PILIHAN MOD OPERASI (BARU)
+    st.subheader("1. Mod Operasi")
+    mod_operasi = st.radio(
+        "Apa anda nak buat?",
+        ["✨ Jana Kod Baru", "🔍 Review Kod Lama"],
+        captions=["Buat projek dari kosong", "Audit kod sedia ada"]
+    )
+    
+    st.divider()
 
-# --- TUNING KNOBS ---
-SAMPLE_SIZE = 50       # Scan max 50 fail per folder
-MIN_YEAR = 2000        # Tarikh bawah 2000 dianggap error (Unix epoch/Bad battery)
-MAX_YEAR = datetime.now().year + 1 # Tarikh masa depan dianggap error
+    st.subheader("2. Enjin AI")
+    model_name = st.text_input("Model Ollama", value="ollama/qwen3:8b")
+    
+    st.subheader("3. Gaya Bahasa")
+    nada = st.selectbox(
+        "Pilih Mood Ejen:",
+        ["Formal (Korporat)", "Santai (Bro/Sis)", "Garang (Senior Lead)"],
+        index=2 # Default Garang untuk Review
+    )
 
-logger = logging.getLogger(__name__)
+    if nada == "Santai (Bro/Sis)":
+        gaya_bahasa = "Gunakan bahasa santai, panggil pengguna 'Bro'. Guna analogi mudah."
+    elif nada == "Garang (Senior Lead)":
+        gaya_bahasa = "Sangat tegas, kritikal, dan pedas. Cari kesalahan sekecil kuman. Jangan berkias."
+    else:
+        gaya_bahasa = "Gunakan Bahasa Melayu baku, profesional, dan sopan."
 
-# ==========================================
-# MODULE 1: METADATA SCANNER
-# ==========================================
-class MetadataScanner:
-    def __init__(self, ignored_dirs: Set[str], ignored_files: Set[str], ignored_ext: Set[str]):
-        self.ignored_dirs = ignored_dirs
-        self.ignored_files = ignored_files
-        self.ignored_ext = ignored_ext
-
-    def scan_folder(self, folder_path: str) -> Tuple[Counter, int]:
-        date_counter = Counter()
-        files_found = []
-        
-        for dirpath, dirnames, filenames in os.walk(folder_path):
-            dirnames[:] = [d for d in dirnames if d not in self.ignored_dirs]
-            for f in filenames:
-                if any(i in f for i in self.ignored_files): continue
-                ext = os.path.splitext(f)[1].lower()
-                if ext in self.ignored_ext: continue
-                
-                if ext in IMAGE_EXT: files_found.insert(0, os.path.join(dirpath, f))
-                elif ext in VIDEO_EXT: files_found.append(os.path.join(dirpath, f))
-
-        if not files_found: return Counter(), 0
-
-        scanned_count = 0
-        valid_dates_found = 0
-        
-        for filepath in files_found:
-            if valid_dates_found >= SAMPLE_SIZE: break
-                
-            date_obj = self._get_date(filepath)
-            scanned_count += 1
-            if date_obj:
-                date_counter[date_obj.strftime("%Y-%m-%d")] += 1
-                valid_dates_found += 1
-                
-        return date_counter, scanned_count
-
-    def _get_date(self, filepath: str) -> Optional[datetime]:
-        ext = os.path.splitext(filepath)[1].lower()
-        if ext in IMAGE_EXT: return self._get_image_date(filepath)
-        elif ext in VIDEO_EXT: return self._get_video_date(filepath)
-        return None
-
-    def _get_image_date(self, filepath: str) -> Optional[datetime]:
-        try:
-            with Image.open(filepath) as img:
-                exif = img.getexif()
-                if not exif: return None
-                date_str = exif.get(36867) or exif.get(306)
-                return self._parse_date(date_str)
-        except Exception: return None
-
-    def _get_video_date(self, filepath: str) -> Optional[datetime]:
-        if not HACHOIR_AVAILABLE: return None
-        try:
-            parser = createParser(filepath)
-            if parser:
-                with parser:
-                    meta = extractMetadata(parser)
-                    if meta and meta.has("creation_date"):
-                        return meta.get("creation_date")
-        except Exception: return None
-
-    @staticmethod
-    def _parse_date(date_str: Any) -> Optional[datetime]:
-        """
-        Parses date strings robustly AND checks for Sanity (Year 2000-Current).
-        """
-        if not date_str: return None
-        try:
-            s = str(date_str).strip().split('+')[0].split('Z')[0].replace('T', ' ')
-            date_part = s.split(' ')[0].replace('-', ':')
-            dt = datetime.strptime(date_part, "%Y:%m:%d")
-            
-            # --- DATE SANITY CHECK ---
-            if MIN_YEAR <= dt.year <= MAX_YEAR:
-                return dt
-            else:
-                return None # Reject 1970 or 2099
-                
-        except (ValueError, TypeError, IndexError): return None
-
-# ==========================================
-# MODULE 2: RENAME EXECUTOR
-# ==========================================
-class RenameExecutor:
-    def __init__(self):
-        self._rename_lock = threading.Lock()
-
-    def sanitize_name(self, name: str) -> str:
-        return re.sub(INVALID_FILENAME_CHARS, '', name).strip()
-
-    def get_unique_path(self, base_path: str) -> str:
-        if not os.path.exists(base_path): return base_path
-        counter = 1
-        while True:
-            new_path = f"{base_path} ({counter})"
-            if not os.path.exists(new_path): return new_path
-            counter += 1
-
-    def execute(self, old_path: str, new_name: str, live_mode: bool) -> Tuple[str, str]:
-        parent_dir = os.path.dirname(old_path)
-        safe_name = self.sanitize_name(new_name)
-        target_base_path = os.path.join(parent_dir, safe_name)
-
-        if os.path.basename(old_path) == safe_name:
-            return 'unchanged', safe_name
-
-        if live_mode:
-            with self._rename_lock:
-                final_path = self.get_unique_path(target_base_path)
-                try:
-                    if not os.path.exists(old_path): return 'error', "Source missing"
-                    os.rename(old_path, final_path)
-                    return 'renamed', os.path.basename(final_path)
-                except OSError as e:
-                    return 'error', str(e)
+    # Profil Pasukan (Kemaskini ikut Mod)
+    st.divider()
+    st.subheader("4. Profil Pasukan")
+    with st.expander("Lihat Ahli Pasukan", expanded=True):
+        if mod_operasi == "✨ Jana Kod Baru":
+            st.info("**🧑‍💻 Jurutaip Kod**\n\nMenulis skrip baru.")
+            st.warning("**🕵️ QA**\n\nSemak kod Jurutaip.")
         else:
-            final_path = self.get_unique_path(target_base_path)
-            return 'dry_run', os.path.basename(final_path)
-
-# ==========================================
-# MODULE 3: ORCHESTRATOR
-# ==========================================
-class MediaFolderOrganizer:
-    def __init__(self, args):
-        self.target_path = os.path.abspath(args.path)
-        self.live_run = args.live
-        self.workers = args.workers
-        self.confidence = args.confidence
-        self.case = args.case
-        
-        self.ignored_dirs = DEFAULT_IGNORED_DIRS.union(set(args.ignore_dirs))
-        self.ignored_ext = DEFAULT_IGNORED_EXT.union(set(args.ignore_ext))
-        
-        self.scanner = MetadataScanner(self.ignored_dirs, DEFAULT_IGNORED_FILES, self.ignored_ext)
-        self.executor = RenameExecutor()
-
-    def _clean_base_name(self, name: str) -> str:
-        # Regex: Remove leading dates/numbers/symbols
-        clean = re.sub(r"^[\d\.\-\/\s]+", "", name).strip()
-        if not clean: return ""
-        
-        # Apply Case Logic Locally
-        if self.case == 'upper': return clean.upper()
-        if self.case == 'lower': return clean.lower()
-        return clean.title()
-
-    def _process_folder(self, folder_path: str) -> Dict[str, Any]:
-        folder_name = os.path.basename(folder_path)
-        result = {'status': 'skipped', 'name': folder_name, 'reason': '', 'new_name': '', 'original_path': folder_path}
-
-        # 1. SCAN
-        dates, total = self.scanner.scan_folder(folder_path)
-        if not dates:
-            result['reason'] = "No valid dates found (Empty)"
-            return result
+            st.warning("**🕵️ QA (Lead)**\n\nAnalisa kod pengguna.")
+            st.info("**🧑‍💻 Jurutaip Kod**\n\nBaiki kod pengguna.")
             
-        # 2. DECIDE
-        try:
-            top_date_info = dates.most_common(1)
-            if not top_date_info:
-                result['reason'] = "Date list empty"
-                return result
-            top_date, count = top_date_info[0]
-            if not top_date: 
-                result['reason'] = "Top date None"
-                return result
-        except IndexError:
-            result['reason'] = "Index Error"
-            return result
+        st.success("**📝 Penulis Teknikal**\n\nBuat laporan.")
 
-        conf = count / total if total > 0 else 0
-        if conf < self.confidence:
-            result['reason'] = f"Low confidence ({conf:.2f})"
-            return result
-
-        # 3. PLAN (No AI, just Regex + Case)
-        base_name = self._clean_base_name(folder_name)
-        new_name_candidate = f"{top_date} {base_name}".strip()
-
-        # 4. EXECUTE
-        status, final_name = self.executor.execute(folder_path, new_name_candidate, self.live_run)
-        
-        result['status'] = status
-        result['new_name'] = final_name
-        result['full_new_path'] = os.path.join(os.path.dirname(folder_path), final_name)
-        if status == 'error': result['reason'] = final_name
-        
-        return result
-
-    def generate_reports(self, results: List[Dict]):
-        """Generates JSON Report and Bash Undo Script"""
-        
-        # 1. JSON Report
-        json_path = "report.json"
-        try:
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(results, f, indent=4, ensure_ascii=False)
-            logger.info(f"📄 Forensic Report saved to: {json_path}")
-        except Exception as e:
-            logger.error(f"Failed to save JSON report: {e}")
-
-        # 2. Undo Script (Bash)
-        undo_path = "undo_restore.sh"
-        renamed_items = [r for r in results if r['status'] == 'renamed']
-        
-        if renamed_items:
-            try:
-                with open(undo_path, 'w', encoding='utf-8') as f:
-                    f.write("#!/bin/bash\n")
-                    f.write("# Undo Script generated by EXIF Organizer\n\n")
-                    for item in renamed_items:
-                        old = item['original_path'].replace('"', '\\"')
-                        new = item['full_new_path'].replace('"', '\\"')
-                        f.write(f'mv "{new}" "{old}"\n')
-                
-                os.chmod(undo_path, 0o755)
-                logger.info(f"↩️  Undo Script saved to: {undo_path}")
-            except Exception as e:
-                logger.error(f"Failed to save Undo script: {e}")
-
-    def run(self):
-        print("\n" + "="*40)
-        print("SYSTEM CHECK (V34 Offline)")
-        print("="*40)
-        if HACHOIR_AVAILABLE: print("✅ [OK] hachoir (Video)")
-        else: print("⚠️  [WARNING] 'hachoir' missing. Videos skipped.")
-        if HEIF_AVAILABLE: print("✅ [OK] pillow-heif (HEIC)")
-        else: print("⚠️  [WARNING] 'pillow-heif' missing. HEIC skipped.")
-        print("="*40 + "\n")
-
-        logger.info(f"🚀 Starting NAS Organizer V34")
-        logger.info(f"📂 Target: {self.target_path}")
-        logger.info(f"📅 Year Check: {MIN_YEAR} - {MAX_YEAR}")
-        
-        subdirs = sorted([f.path for f in os.scandir(self.target_path) if f.is_dir() 
-                         and os.path.basename(f.path) not in self.ignored_dirs])
-        
-        stats = Counter()
-        skipped_details = []
-        all_results = []
-
-        with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            futures = {pool.submit(self._process_folder, f): f for f in subdirs}
-            
-            for fut in tqdm(as_completed(futures), total=len(subdirs), unit="dir"):
-                try:
-                    res = fut.result()
-                    all_results.append(res)
-                    stats[res['status']] += 1
-                    
-                    if res['status'] == 'renamed':
-                        logger.info(f"✅ {res['name']} -> {res['new_name']}")
-                    elif res['status'] == 'dry_run':
-                        logger.info(f"🔮 {res['name']} -> {res['new_name']}")
-                    elif res['status'] == 'error':
-                        logger.error(f"❌ {res['name']}: {res['reason']}")
-                    elif res['status'] == 'skipped':
-                        skipped_details.append(f"{res['name']} ({res['reason']})")
-                        
-                except Exception as e:
-                    logger.critical(f"Worker Crash: {e}")
-                    stats['crash'] += 1
-
-        self.generate_reports(all_results)
-
-        print("\n" + "="*40)
-        print("          FINAL REPORT")
-        print("="*40)
-        print(f"📂 Total Scanned : {len(subdirs)}")
-        print(f"✅ Renamed       : {stats['renamed']}")
-        print(f"🔮 Dry Run       : {stats['dry_run']}")
-        print(f"💤 Unchanged     : {stats['unchanged']}")
-        print(f"⏭️  Skipped       : {stats['skipped']}")
-        print(f"❌ Errors        : {stats['error']}")
-        print("-" * 40)
-        print(f"📄 Full Report   : report.json")
-        if stats['renamed'] > 0:
-            print(f"↩️  Undo Script   : ./undo_restore.sh")
-        
-        if skipped_details:
-            print("-" * 40)
-            print("⚠️  Skipped Samples:")
-            for s in skipped_details[:5]: print(f" • {s}")
-            if len(skipped_details) > 5: print(f"   ... and {len(skipped_details)-5} more (see json).")
-        print("="*40 + "\n")
+# --- 4. UI UTAMA ---
+st.title(f"🛡️ Pasukan AI: {mod_operasi}")
 
 def main():
-    parser = argparse.ArgumentParser(description="NAS Photo Organizer V34 (Offline)")
-    parser.add_argument("path", help="Folder path")
-    parser.add_argument("--live", action="store_true", help="Enable renaming")
-    parser.add_argument("--workers", type=int, default=4, help="Default: 4")
-    parser.add_argument("--confidence", type=float, default=0.6)
-    parser.add_argument("--case", default='upper', choices=['title', 'upper', 'lower'])
     
-    # Optional flags
-    parser.add_argument("--debug", action="store_true", help="Enable verbose logs")
-    parser.add_argument("--ignore-dirs", nargs='+', default=[], help="Add dirs to ignore")
-    parser.add_argument("--ignore-ext", nargs='+', default=[], help="Add extensions to ignore")
-
-    args = parser.parse_args()
+    inputs = {}
     
-    lvl = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(filename="exif-nas.log", filemode='w', level=lvl,
-                        format="%(asctime)s - %(levelname)s - %(message)s")
-    
-    console = logging.StreamHandler()
-    console.setLevel(logging.WARNING) 
-    logging.getLogger('').addHandler(console)
+    # UI BERUBAH IKUT MOD
+    if mod_operasi == "✨ Jana Kod Baru":
+        user_input = st.text_area("🎯 Masukkan Idea Projek:", height=100, 
+                             placeholder="Contoh: Buat script game Snake...")
+        tombol_teks = "🚀 JANA KOD"
+    else:
+        user_input = st.text_area("🐍 Tampal Kod Python Anda Di Sini:", height=200, 
+                             placeholder="def fungsi_saya():\n    pass...")
+        tombol_teks = "🔍 AUDIT KOD SAYA"
 
-    if not os.path.exists(args.path):
-        print("Error: Path not found.")
-        return
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        start_btn = st.button(tombol_teks, type="primary", use_container_width=True)
 
-    MediaFolderOrganizer(args).run()
+    if start_btn and user_input:
+        
+        os.environ["OPENAI_API_KEY"] = "NA"
+        os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true"
+        os.environ["OTEL_SDK_DISABLED"] = "true"
+        
+        with st.status("🤖 Sedang Memproses...", expanded=True) as status:
+            st.write("🔌 Menghubungkan ke Neural Network...")
+            log_expander = st.expander("Log Terminal Live", expanded=True)
+            
+            try:
+                my_llm = LLM(model=model_name, base_url="http://localhost:11434")
+
+                # --- DEFINISI EJEN ---
+                coder = Agent(
+                    role='Senior Python Developer',
+                    goal='Menulis kod Python bertaraf dunia (World Class).',
+                    backstory=f"Pakar refactoring. {gaya_bahasa} Anda membaiki kod buruk menjadi seni.",
+                    llm=my_llm, verbose=True
+                )
+
+                qa = Agent(
+                    role='Security & Logic Auditor',
+                    goal='Mencari bug, celah keselamatan, dan kod yang tidak efisien.',
+                    backstory=f"Auditor kod yang kejam. {gaya_bahasa} Anda tidak teragak-agak mengkritik kod pengguna.",
+                    llm=my_llm, verbose=True
+                )
+
+                writer = Agent(
+                    role='Technical Report Writer',
+                    goal='Menyediakan laporan bedah siasat kod.',
+                    backstory=f"Pakar dokumentasi. {gaya_bahasa}",
+                    llm=my_llm, verbose=True
+                )
+
+                # --- LOGIK TUGASAN BERUBAH IKUT MOD ---
+                tasks_list = []
+                
+                if mod_operasi == "✨ Jana Kod Baru":
+                    # Aliran: Coder -> QA -> Writer
+                    task1 = Task(description=f"Tulis kod untuk: {user_input}", expected_output="Kod Python.", agent=coder)
+                    task2 = Task(description="Semak kod Coder.", expected_output="Kod lulus QA.", agent=qa, context=[task1])
+                    task3 = Task(description="Buat dokumentasi.", expected_output="Markdown.", agent=writer, context=[task2])
+                    tasks_list = [task1, task2, task3]
+                    
+                else: 
+                    # MOD REVIEW: QA -> Coder -> Writer
+                    # 1. QA Baca Kod Pengguna Dulu
+                    task1 = Task(
+                        description=f"Analisa kod pengguna ini baris demi baris:\n```python\n{user_input}\n```\nSenaraikan SEMUA bug, risiko sekuriti, dan gaya penulisan yang buruk.",
+                        expected_output="Senarai kesalahan kod dalam point form.",
+                        agent=qa
+                    )
+                    
+                    # 2. Coder Baiki Kod Tu
+                    task2 = Task(
+                        description="Berdasarkan kritikan QA, tulis semula kod pengguna supaya menjadi versi yang 'Perfect'.",
+                        expected_output="Kod Python Versi 2.0 yang telah dibaiki sepenuhnya.",
+                        agent=coder,
+                        context=[task1]
+                    )
+                    
+                    # 3. Writer Buat Laporan
+                    task3 = Task(
+                        description="Bina laporan 'Code Review'. Masukkan: 1. Apa yang salah dulu. 2. Apa yang dah dibaiki. 3. Kod penuh baru.",
+                        expected_output="Laporan Markdown.",
+                        agent=writer,
+                        context=[task1, task2]
+                    )
+                    tasks_list = [task1, task2, task3]
+
+                # --- JALANKAN CREW ---
+                crew = Crew(
+                    agents=[qa, coder, writer],
+                    tasks=tasks_list,
+                    verbose=True,
+                    process=Process.sequential
+                )
+
+                # Hijack Terminal
+                sys.stdout = StreamToExpander(log_expander)
+                result = crew.kickoff()
+                sys.stdout = sys.__stdout__ # Reset
+                
+                status.update(label="✅ Siap!", state="complete", expanded=False)
+
+                # --- PAPARAN HASIL ---
+                st.divider()
+                
+                kod_python = extract_python_code(str(result))
+                
+                tab1, tab2 = st.tabs(["📄 Laporan Review", "✨ Kod Baru (.py)"])
+                
+                with tab1:
+                    st.markdown(result)
+                    
+                with tab2:
+                    if mod_operasi == "🔍 Review Kod Lama":
+                        st.caption("Ini adalah versi kod anda yang telah dibaiki:")
+                    st.code(kod_python, language='python')
+
+            except Exception as e:
+                sys.stdout = sys.__stdout__
+                st.error(f"Ralat: {e}")
 
 if __name__ == "__main__":
     main()
