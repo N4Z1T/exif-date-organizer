@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict, Any, Iterable, Set
+import shutil
 
 # --- Library Safety Imports ---
 try:
@@ -43,11 +44,11 @@ except ImportError:
 # --- SYSTEM DEFAULTS ---
 DEFAULT_IGNORED_DIRS = {'@eaDir', '#recycle', '.DS_Store', 'venv', '.git', 'lost+found', 'Thumbs.db'}
 DEFAULT_IGNORED_FILES = {'SYNOFILE_THUMB', 'desktop.ini', '.DS_Store', 'Thumbs.db'}
-DEFAULT_IGNORED_EXT = {'.db', '.tmp', '.ini', '.txt', '.log', '.json', '.sh', '.py'}
+DEFAULT_IGNORED_EXT = {'.db', '.tmp', '.ini', '.txt', '.log', '.json', '.sh', '.py', '.ps1'}
 
 INVALID_FILENAME_CHARS = r'[<>:"/\\|?*]'
-IMAGE_EXT = ('.jpg', '.jpeg', '.png', '.tiff', '.heic')
-VIDEO_EXT = ('.mp4', '.mov', '.avi', '.mkv', '.3gp', '.m4v')
+IMAGE_EXT = frozenset({'.jpg', '.jpeg', '.png', '.tiff', '.heic'})
+VIDEO_EXT = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.3gp', '.m4v'})
 
 # --- TUNING KNOBS ---
 SAMPLE_SIZE = 50       # Scan max 50 fail per folder
@@ -67,7 +68,10 @@ class MetadataScanner:
 
     def scan_folder(self, folder_path: str) -> Tuple[Counter, int]:
         date_counter = Counter()
-        files_found = []
+        
+        # Optimization: Use separate lists
+        images = []
+        videos = []
         
         for dirpath, dirnames, filenames in os.walk(folder_path):
             dirnames[:] = [d for d in dirnames if d not in self.ignored_dirs]
@@ -76,8 +80,10 @@ class MetadataScanner:
                 ext = os.path.splitext(f)[1].lower()
                 if ext in self.ignored_ext: continue
                 
-                if ext in IMAGE_EXT: files_found.insert(0, os.path.join(dirpath, f))
-                elif ext in VIDEO_EXT: files_found.append(os.path.join(dirpath, f))
+                if ext in IMAGE_EXT: images.append(os.path.join(dirpath, f))
+                elif ext in VIDEO_EXT: videos.append(os.path.join(dirpath, f))
+
+        files_found = images + videos
 
         if not files_found: return Counter(), 0
 
@@ -119,7 +125,16 @@ class MetadataScanner:
                     meta = extractMetadata(parser)
                     if meta and meta.has("creation_date"):
                         return meta.get("creation_date")
-        except Exception: return None
+        except Exception: pass
+        
+        # Fallback to mtime if hachoir fails
+        try:
+            mtime = os.path.getmtime(filepath)
+            dt = datetime.fromtimestamp(mtime)
+            if MIN_YEAR <= dt.year <= MAX_YEAR:
+                return dt
+        except Exception: pass
+        return None
 
     @staticmethod
     def _parse_date(date_str: Any) -> Optional[datetime]:
@@ -149,10 +164,11 @@ class RenameExecutor:
     def get_unique_path(self, base_path: str) -> str:
         if not os.path.exists(base_path): return base_path
         counter = 1
-        while True:
+        while counter < 1000:
             new_path = f"{base_path} ({counter})"
             if not os.path.exists(new_path): return new_path
             counter += 1
+        return base_path
 
     def execute(self, old_path: str, new_name: str, live_mode: bool) -> Tuple[str, str]:
         parent_dir = os.path.dirname(old_path)
@@ -167,7 +183,9 @@ class RenameExecutor:
                 final_path = self.get_unique_path(target_base_path)
                 try:
                     if not os.path.exists(old_path): return 'error', "Source missing"
-                    os.rename(old_path, final_path)
+                    
+                    # Use shutil.move for robustness (handles cross-device moves if needed)
+                    shutil.move(old_path, final_path)
                     return 'renamed', os.path.basename(final_path)
                 except OSError as e:
                     return 'error', str(e)
@@ -185,7 +203,7 @@ class MediaFolderOrganizer:
         self.workers = args.workers
         self.confidence = args.confidence
         self.case = args.case
-        self.file_prefix = file_prefix # Untuk nama file report/undo
+        self.file_prefix = file_prefix
         
         self.ignored_dirs = DEFAULT_IGNORED_DIRS.union(set(args.ignore_dirs))
         self.ignored_ext = DEFAULT_IGNORED_EXT.union(set(args.ignore_ext))
@@ -245,7 +263,7 @@ class MediaFolderOrganizer:
         return result
 
     def generate_reports(self, results: List[Dict]):
-        """Generates JSON Report and Bash Undo Script with DYNAMIC NAMES"""
+        """Generates JSON Report and Bash/PS1 Undo Scripts"""
         
         # 1. JSON Report
         json_path = f"{self.file_prefix}_report.json"
@@ -256,28 +274,41 @@ class MediaFolderOrganizer:
         except Exception as e:
             logger.error(f"Failed to save JSON report: {e}")
 
-        # 2. Undo Script (Bash)
-        undo_path = f"{self.file_prefix}_undo.sh"
         renamed_items = [r for r in results if r['status'] == 'renamed']
-        
-        if renamed_items:
-            try:
-                with open(undo_path, 'w', encoding='utf-8') as f:
-                    f.write("#!/bin/bash\n")
-                    f.write(f"# Undo Script for target: {self.target_path}\n\n")
-                    for item in renamed_items:
-                        old = item['original_path'].replace('"', '\\"')
-                        new = item['full_new_path'].replace('"', '\\"')
-                        f.write(f'mv "{new}" "{old}"\n')
-                
-                os.chmod(undo_path, 0o755)
-                logger.info(f"↩️  Undo Script saved to: {undo_path}")
-            except Exception as e:
-                logger.error(f"Failed to save Undo script: {e}")
+        if not renamed_items: return
+
+        # 2. Bash Undo Script
+        undo_path = f"{self.file_prefix}_undo.sh"
+        try:
+            with open(undo_path, 'w', encoding='utf-8') as f:
+                f.write("#!/bin/bash\n")
+                f.write(f"# Undo Script for target: {self.target_path}\n\n")
+                for item in renamed_items:
+                    old = item['original_path'].replace('"', '\\"')
+                    new = item['full_new_path'].replace('"', '\\"')
+                    f.write(f'mv "{new}" "{old}"\n')
+            
+            os.chmod(undo_path, 0o755)
+            logger.info(f"↩️  Undo Script saved to: {undo_path}")
+        except Exception as e:
+            logger.error(f"Failed to save Undo script: {e}")
+
+        # 3. PowerShell Undo Script
+        undo_ps1 = f"{self.file_prefix}_undo.ps1"
+        try:
+            with open(undo_ps1, 'w', encoding='utf-8') as f:
+                f.write("# PowerShell Undo Script\n\n")
+                for item in renamed_items:
+                    old = item['original_path'].replace("'", "''")
+                    new = item['full_new_path'].replace("'", "''")
+                    f.write(f"Move-Item -Path '{new}' -Destination '{old}' -Force\n")
+            logger.info(f"↩️  PowerShell Undo saved to: {undo_ps1}")
+        except Exception as e:
+            logger.error(f"Failed to save PS1 Undo: {e}")
 
     def run(self):
         print("\n" + "="*40)
-        print("SYSTEM CHECK (V35 Dynamic Logs)")
+        print("SYSTEM CHECK (V35 Final)")
         print("="*40)
         if HACHOIR_AVAILABLE: print("✅ [OK] hachoir (Video)")
         else: print("⚠️  [WARNING] 'hachoir' missing. Videos skipped.")
@@ -331,7 +362,7 @@ class MediaFolderOrganizer:
         print("-" * 40)
         print(f"📄 Full Report   : {self.file_prefix}_report.json")
         if stats['renamed'] > 0:
-            print(f"↩️  Undo Script   : {self.file_prefix}_undo.sh")
+            print(f"↩️  Undo Script   : {self.file_prefix}_undo.sh / .ps1")
         
         if skipped_details:
             print("-" * 40)
@@ -344,7 +375,11 @@ def main():
     parser = argparse.ArgumentParser(description="NAS Photo Organizer V35 (Dynamic Log)")
     parser.add_argument("path", help="Folder path")
     parser.add_argument("--live", action="store_true", help="Enable renaming")
-    parser.add_argument("--workers", type=int, default=4, help="Default: 4")
+    
+    # Auto-detect CPU threads (Conservative: CPU / 2)
+    default_workers = max(1, (os.cpu_count() or 4) // 2)
+    parser.add_argument("--workers", type=int, default=default_workers, help=f"Default: {default_workers} (Auto: CPU/2)")
+    
     parser.add_argument("--confidence", type=float, default=0.6)
     parser.add_argument("--case", default='upper', choices=['title', 'upper', 'lower'])
     parser.add_argument("--debug", action="store_true", help="Enable verbose logs")
@@ -359,8 +394,7 @@ def main():
 
     # --- DYNAMIC FILENAME GENERATION ---
     # Convert path to filename safe string: "volume1_Gambar_2025"
-    # Strip slashes, replace remaining with underscore
-    safe_path_name = args.path.strip().strip(os.sep).replace(os.sep, "_").replace(":", "")
+    safe_path_name = re.sub(r'[^a-zA-Z0-9]', '_', args.path.strip()).strip('_')
     if not safe_path_name: safe_path_name = "nas_organizer_root"
     
     log_filename = f"{safe_path_name}.log"
