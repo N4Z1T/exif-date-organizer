@@ -31,5 +31,5 @@
 ### Changed
 - **OOP Rewrite:** Memecahkan kod procedural kepada kelas (`Scanner`, `Executor`).
 - **Atomic Locking:** Menambah `threading.Lock` pada operasi rename.
-- **Strict Logic:** Membuang tekaan tarikh (no fallback), skip jika tiada metadata valid.
+- **Strict Logic:** Membuang tekaan tarikh dari nama fail (filename parsing). Fallback kepada *file mtime* hanya untuk video jika metadata gagal.
 - **Fix:** Masalah trailing space pada nama folder jika nama asal kosong.

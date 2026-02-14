@@ -1,3 +1,5 @@
+AI INSTRUCTIONS: Always read CONTEXT.md and CHANGELOG.md before suggesting any code changes to ensure session continuity.
+
 # EXIF Parallel Organizer
 
 A high-performance Python script designed to automatically organize and rename large collections of media folders. Leveraging multi-threading, this tool processes folders in parallel to drastically reduce execution time. It intelligently extracts creation dates from images and videos and uses a confidence-based system to ensure accuracy.

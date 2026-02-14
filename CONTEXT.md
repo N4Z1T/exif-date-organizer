@@ -26,7 +26,7 @@ Kod disusun mengikut prinsip **Single Responsibility Principle (SRP)**:
     - Default worker dihadkan kepada `CPU / 2` atau min 4.
     - Menggunakan `SAMPLE_SIZE = 50` untuk mengelakkan bacaan disk berlebihan.
 2.  **Offline First:**
-    - Tiada pergantungan kepada API luar (AI Removed in V34). Logik bergantung pada Regex dan Metadata sahaja.
+    - Tiada pergantungan kepada API luar (AI Removed in V34). Logik bergantung pada Regex, Metadata Dalaman, dan File Creation Date (mtime) sahaja.
 3.  **Data Integrity:**
     - `os.rename` atau `shutil.move` mesti diletakkan dalam `threading.Lock()` untuk mengelakkan *Race Condition*.
     - **Date Sanity:** Tarikh mesti antara Tahun 2000 hingga (Tahun Semasa + 1).
