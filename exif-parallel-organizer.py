@@ -74,7 +74,10 @@ class MetadataScanner:
         videos = []
         
         for dirpath, dirnames, filenames in os.walk(folder_path):
-            dirnames[:] = [d for d in dirnames if d not in self.ignored_dirs]
+            # Help linter understand dirnames is a list that can be modified in-place
+            valid_dirs = [d for d in dirnames if d not in self.ignored_dirs]
+            dirnames.clear()
+            dirnames.extend(valid_dirs)
             for f in filenames:
                 if any(i in f for i in self.ignored_files): continue
                 ext = os.path.splitext(f)[1].lower()
@@ -87,17 +90,17 @@ class MetadataScanner:
 
         if not files_found: return Counter(), 0
 
-        scanned_count = 0
-        valid_dates_found = 0
+        scanned_count: int = 0
+        valid_dates_found: int = 0
         
         for filepath in files_found:
             if valid_dates_found >= SAMPLE_SIZE: break
                 
             date_obj = self._get_date(filepath)
-            scanned_count += 1
+            scanned_count = scanned_count + 1
             if date_obj:
                 date_counter[date_obj.strftime("%Y-%m-%d")] += 1
-                valid_dates_found += 1
+                valid_dates_found = valid_dates_found + 1  # type: ignore[operator]
                 
         return date_counter, scanned_count
 
@@ -326,8 +329,11 @@ class MediaFolderOrganizer:
         skipped_details = []
         all_results = []
 
+        def _submit_folder(path: str) -> Dict[str, Any]:
+            return self._process_folder(path)
+
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            futures = {pool.submit(self._process_folder, f): f for f in subdirs}
+            futures = {pool.submit(_submit_folder, f): f for f in subdirs}  # type: ignore[arg-type]
             
             for fut in tqdm(as_completed(futures), total=len(subdirs), unit="dir"):
                 try:
@@ -367,7 +373,12 @@ class MediaFolderOrganizer:
         if skipped_details:
             print("-" * 40)
             print("⚠️  Skipped Samples:")
-            for s in skipped_details[:5]: print(f" • {s}")
+            # Use a more primitive way to slice to avoid indexing errors
+            count = 0
+            for s in skipped_details:
+                if count >= 5: break
+                print(f" • {s}")
+                count += 1
             if len(skipped_details) > 5: print(f"   ... and {len(skipped_details)-5} more (see json).")
         print("="*40 + "\n")
 

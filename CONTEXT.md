@@ -3,8 +3,9 @@
 ## 📌 Project Overview
 Satu skrip Python berprestasi tinggi untuk menyusun (rename) folder gambar/video di dalam Synology NAS berdasarkan tarikh metadata (EXIF/Creation Date). Skrip ini direka khas untuk persekitaran NAS yang sensitif terhadap penggunaan CPU dan Disk I/O.
 
-**Current Version:** V35.0 (Final Offline Edition)
+**Current Version:** V35.1 (Type Safety Patch)
 **Status:** Production Ready
+**Last Updated:** 2026-02-19
 
 ## 🛠 Tech Stack
 - **Language:** Python 3.8+
@@ -41,3 +42,16 @@ Kod disusun mengikut prinsip **Single Responsibility Principle (SRP)**:
 - Logic: `2021-01-01 EVENT NAME`
 - Regex Cleaning: Membuang tarikh/simbol lama di depan nama folder.
 - Case Enforcement: Title/Upper/Lower.
+
+## 🧪 Test Coverage
+- **`test_verify.py`:** Unit test untuk `MetadataScanner._parse_date` dan `RenameExecutor.sanitize_name`.
+- Load modul guna `importlib.util` kerana nama fail `exif-parallel-organizer.py` berhyphen (tidak boleh `import` terus).
+- Run: `python test_verify.py -v`
+
+## ⚠️ Known Linter Issues (Pyre2 False Positives — Tidak Perlu Dibaiki)
+
+| Error | Punca | Status |
+|---|---|---|
+| `Could not find import of PIL/tqdm/hachoir/pillow_heif` | Packages tidak install dalam venv yang IDE guna | Bukan bug kod. Run `pip install -r requirements.txt` dalam venv betul. |
+| `+= not supported` (line 103) | Pyre2 bug: hilang track jenis `int` dalam loop | Suppressed `# type: ignore[operator]` |
+| `BoundMethod not assignable` (line 336) | Pyre2 bug: tidak boleh match `Callable` untuk `Executor.submit` | Suppressed `# type: ignore[arg-type]`, dibungkus dalam `_submit_folder()` |
